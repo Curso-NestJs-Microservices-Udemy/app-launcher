@@ -1,0 +1,233 @@
+# ==============================================================================
+# Stack completo del proyecto en Docker Compose.
+#
+#   nats           -> broker de mensajes (NATS + JetStream)
+#   orders-db      -> PostgreSQL del microservicio de ordenes
+#   orders-ms      -> microservicio de ordenes (NATS)
+#   products-ms    -> microservicio de productos (NATS) + SQLite
+#   client-gateway -> API HTTP que consume los microservicios por NATS
+#
+# Uso:  docker compose up -d --build
+# ==============================================================================
+
+# Nombre del proyecto de Compose. Docker lo usa como prefijo de los nombres de
+# los containers, las redes y los volumenes (ej: nest-microservices_orders-db_1),
+# asi evita colisiones con otros proyectos Docker que tengas corriendo.
+name: nest-microservices
+
+# Cada clave de `services` define un container.
+services:
+  # ---------------------------------------------------------------------------
+  # NATS: broker de mensajes. Todos los microservicios se comunican por aca.
+  # ---------------------------------------------------------------------------
+  nats:
+    # Imagen oficial. La variante `-alpine` es mas liviana (~10 MB) que la
+    # basada en Debian. La version 2.10 es la estable que usan las apps del
+    # proyecto.
+    image: nats:2.10-alpine
+
+    # Nombre fijo del container (en vez de "nest-microservices-nats-1").
+    # Consecuencia: no se puede escalar este servicio con `--scale`.
+    container_name: nats-server
+
+    # Si el container se cae, Docker lo reinicia automaticamente (salvo que lo
+    # pares vos con `docker compose stop`).
+    restart: unless-stopped
+
+    # Flags del server de NATS:
+    #   -js       -> habilita JetStream (persistencia de mensajes en disco)
+    #   -sd /data -> directorio del store de JetStream (apunta al volumen, no al
+    #                filesystem del container, asi los datos sobreviven)
+    #   -m 8222   -> habilita el endpoint de monitoring HTTP en el puerto 8222
+    #                (se usa abajo como healthcheck: /healthz)
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+
+    # "host:container" -> publica el puerto en tu maquina.
+    #   4222 -> clientes NATS (los microservicios y el gateway)
+    #   8222 -> monitoring (http://localhost:8222/healthz, /varz, etc.)
+    ports: ["4222:4222", "8222:8222"]
+
+    # Volumen nombrado para el store de JetStream. La sintaxis "nombre:/ruta"
+    # usa el volumen "nats-data" declarado al final del archivo.
+    volumes: ["nats-data:/data"]
+
+    # Healthcheck: mientras no este "healthy", los servicios que dependen de
+    # NATS no se levantan (ver `depends_on` mas abajo).
+    healthcheck:
+      # wget viene en busybox (alpine). -O - vuelca el body a stdout y -q silencia
+      # el output; el exit code 0/1 es lo que Docker interpreta como healthy/no.
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8222/healthz"]
+      # Cada cuanto se chequea.
+      interval: 10s
+      # Tiempo maximo de cada intento; si lo supera, el intento cuenta como fallido.
+      timeout: 5s
+      # Cantidad de intentos fallidos seguidos antes de marcarlo como "unhealthy".
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL: base de datos del microservicio de ordenes.
+  # ---------------------------------------------------------------------------
+  orders-db:
+    image: postgres:16.2
+
+    container_name: orders_database
+
+    restart: unless-stopped
+
+    # Variables que consume la imagen oficial de postgres para inicializar el
+    # cluster. OJO: solo se aplican cuando el volumen esta VACIO (primera
+    # creacion). Si cambias la password despues, no tiene efecto: hay que
+    # borrar el volumen (`docker compose down -v`).
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "123456"
+      POSTGRES_DB: ordersdb
+
+    # Volumen nombrado para el DATADIR de postgres. Se prefiere un named volume
+    # (y no un bind mount tipo ./orders-ms/postgres) porque el directorio del
+    # host queda con permisos del usuario root y el usuario "postgres" del
+    # container no puede escribir ahi (Permission denied).
+    volumes: ["orders-db-data:/var/lib/postgresql/data"]
+
+    # Publica el 5432 para que puedas conectarte desde el host (pgAdmin, DBeaver,
+    # psql). Si no lo necesitas, podes quitarlo y evitar conflictos de puerto.
+    ports: ["5432:5432"]
+
+    healthcheck:
+      # pg_isready viene en la imagen de postgres. -U/-D apuntan al usuario y a la
+      # base de datos. Devuelve 0 cuando el server acepta conexiones.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ordersdb"]
+      interval: 10s
+      timeout: 5s
+      # Mas retries que en NATS: en el primer arranque postgres tarda en
+      # inicializar el cluster (crea la base, corre los scripts de init).
+      retries: 10
+      # Durante este periodo los fallos NO cuentan para el calculo de retries.
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Microservicio de ordenes (NATS). No expone HTTP: por eso no tiene `ports`.
+  # ---------------------------------------------------------------------------
+  orders-ms:
+    # Construye la imagen desde el Dockerfile de ./orders-ms.
+    # `context` = carpeta que se le pasa al build (ahi vive el .dockerignore).
+    # `target` = etapa del Dockerfile multi-stage que se construye. Sin esto
+    # compose construiria la ultima etapa (production), que no tiene hot-reload.
+    build: { context: ./orders-ms, target: development }
+
+    container_name: orders-ms
+
+    restart: unless-stopped
+
+    # Variables de entorno del container. Tienen prioridad sobre el archivo
+    # .env del proyecto (dotenv NO pisa variables ya definidas en el entorno).
+    # Por eso aca van las direcciones con nombres de servicio en lugar de
+    # "localhost": dentro de un container, localhost es el propio container.
+    environment:
+      # Puerto que usa la app para el log (joi lo valida al arrancar: si falta
+      # o no es numerico, la app tira error).
+      PORT: "3002"
+      # Broker de mensajes. orders-ms hace split(',') y lo maneja como array.
+      NATS_SERVERS: "nats://nats:4222"
+      # String de conexion a Prisma. "orders-db" es el nombre del servicio de
+      # postgres (DNS interno de Compose); ?schema=public es el schema default.
+      DATABASE_URL: "postgresql://postgres:123456@orders-db:5432/ordersdb?schema=public"
+
+    # Monta SOLO el codigo fuente desde el host para tener hot-reload
+    # (`nest start --watch` recompila al vuelo). node_modules NO se monta:
+    # pnpm usa symlinks que quedarian rotos apuntando al node_modules del host.
+    volumes: ["./orders-ms/src:/usr/src/app/src"]
+
+    # Espera a que los servicios de los que depende estan listos.
+    # `service_healthy` -> espera a que su healthcheck de OK.
+    depends_on:
+      nats:
+        condition: service_healthy
+      orders-db:
+        condition: service_healthy
+
+    # El comando de arranque NO esta aca: sale del CMD del Dockerfile, que es
+    #   sh -c "pnpm exec prisma migrate deploy && pnpm run start:dev"
+    # (aplica las migraciones y despues levanta la app en modo watch).
+
+  # ---------------------------------------------------------------------------
+  # Microservicio de productos (NATS). Persistencia en SQLite.
+  # ---------------------------------------------------------------------------
+  products-ms:
+    # Etapa `development` del Dockerfile multi-stage (con hot-reload).
+    build: { context: ./products-ms, target: development }
+
+    container_name: products-ms
+
+    restart: unless-stopped
+
+    environment:
+      PORT: "3001"
+      NATS_SERVERS: "nats://nats:4222"
+      # URL de SQLite con ruta ABSOLUTA dentro del container (el archivo vive en
+      # el volumen /data). Con "file:./dev.db" la ruta seria relativa al
+      # directorio de trabajo y no persistiria entre recreaciones.
+      DATABASE_URL: "file:/data/dev.db"
+
+    volumes:
+      # Hot-reload del codigo (mismo criterio que orders-ms).
+      - "./products-ms/src:/usr/src/app/src"
+      # Volumen nombrado con el archivo SQLite (/data/dev.db).
+      - "products-data:/data"
+
+    depends_on:
+      nats:
+        condition: service_healthy
+
+    # Sin `ports`: este microservicio no expone ningun puerto (solo NATS).
+    # CMD desde el Dockerfile:
+    #   prisma migrate deploy + seed de data/products.sql (idempotente con
+    #   INSERT OR IGNORE) + pnpm run start:dev
+
+  # ---------------------------------------------------------------------------
+  # Gateway HTTP: el unico punto de entrada desde afuera (puerto 3000).
+  # ---------------------------------------------------------------------------
+  client-gateway:
+    # Etapa `development` del Dockerfile multi-stage (con hot-reload).
+    build: { context: ./client-gateway, target: development }
+
+    container_name: client-gateway
+
+    restart: unless-stopped
+
+    # Expone la API HTTP. El prefijo global es /api (app.setGlobalPrefix),
+    # asi las rutas quedan en http://localhost:3000/api/products y /api/orders.
+    ports: ["3000:3000"]
+
+    environment:
+      PORT: "3000"
+      NATS_SERVERS: "nats://nats:4222"
+
+    volumes: ["./client-gateway/src:/usr/src/app/src"]
+
+    depends_on:
+      nats:
+        condition: service_healthy
+      # orders-ms y products-ms no tienen healthcheck posible (no exponen HTTP),
+      # asi que solo se espera a que el container este iniciado
+      # (`service_started`). Si un microservicio falla despues, el gateway
+      # queda arriba y devuelve 500 en las rutas que lo requieren.
+      orders-ms:
+        condition: service_started
+      products-ms:
+        condition: service_started
+
+    # CMD desde el Dockerfile: pnpm run start:dev
+
+# ------------------------------------------------------------------------------
+# Volumenes nombrados. Compose los crea automaticamente (managed volumes) la
+# primera vez que se levanta el stack, y los conserva entre `docker compose
+# down`. Solo se borran con `docker compose down -v`.
+# ------------------------------------------------------------------------------
+volumes:
+  # Store de JetStream de NATS.
+  nats-data:
+  # Datadir de PostgreSQL (datos de orders-db).
+  orders-db-data:
+  # Archivo SQLite de products-ms.
+  products-data:
