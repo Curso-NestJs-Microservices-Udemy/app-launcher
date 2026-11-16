@@ -50,8 +50,10 @@ servicio explica qué hace y por qué está configurado como está.
 - No hace falta Node ni pnpm en el host: las imágenes instalan sus dependencias.
 
 ## Levantar el stack
-
-```bash
+1. Clonar el repositorio
+2. Ejecutar el comando `git submodule update --init --recursive` para reconstruir los submodulos.
+3. Ejecutar en bash
+```
 docker compose up -d --build
 ```
 
