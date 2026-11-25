@@ -219,6 +219,39 @@ services:
 
     # CMD desde el Dockerfile: pnpm run start:dev
 
+  # ---------------------------------------------------------------------------
+  # Microservicio de pagos (HTTP + Stripe). No depende de NATS ni de ninguna DB:
+  # es una API HTTP que crea sesiones de checkout y recibe el webhook de Stripe.
+  # ---------------------------------------------------------------------------
+  payments-ms:
+    # Etapa `development` del Dockerfile multi-stage (con hot-reload).
+    build: { context: ./payments-ms, target: development }
+
+    container_name: payments-ms
+
+    restart: unless-stopped
+
+    # Expone la API HTTP (puerto 3003). Las URLs de success/cancel de Stripe
+    # apuntan a http://localhost:3003/payments/..., asi que el puerto tiene que
+    # estar publicado en el host para que el navegador pueda volver del checkout.
+    ports: ["3003:3003"]
+
+    # Las variables salen del .env del microservicio (PORT, STRIPE_SECRET,
+    # STRIPE_WEBHOOK_SECRET, STRIPE_SUCCESS_URL, STRIPE_CANCEL_URL). Todas son
+    # Joi-required en src/config/envs.ts: sin alguna, la app tira
+    # "Config validation error" al arrancar.
+    # Se usa env_file en vez de hardcodearlas aca para no commitear las claves
+    # de Stripe: el .env esta gitignored y excluido del build por .dockerignore.
+    env_file: ./payments-ms/.env
+
+    # Hot-reload del codigo (mismo criterio que orders-ms y products-ms):
+    # solo se monta ./src, node_modules NO se monta porque los symlinks de pnpm
+    # quedarian rotos apuntando al node_modules del host.
+    volumes: ["./payments-ms/src:/usr/src/app/src"]
+
+    # Sin depends_on: no consume NATS ni base de datos.
+    # CMD desde el Dockerfile: pnpm run start:dev
+
 # ------------------------------------------------------------------------------
 # Volumenes nombrados. Compose los crea automaticamente (managed volumes) la
 # primera vez que se levanta el stack, y los conserva entre `docker compose
