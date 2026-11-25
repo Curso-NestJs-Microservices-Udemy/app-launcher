@@ -94,6 +94,7 @@ docker compose up -d --build
 docker compose logs -f products-ms
 docker compose logs -f orders-ms
 docker compose logs -f client-gateway
+docker compose logs -f payments-ms
 ```
 
 
