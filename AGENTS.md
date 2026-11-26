@@ -9,12 +9,12 @@ Repo launcher de un curso de microservicios NestJS: cuatro apps en submodules gi
 | `client-gateway/` | API HTTP pública (`:3000`, prefijo `/api`) que habla por NATS |
 | `orders-ms/` | Microservicio NATS sin HTTP + Prisma/PostgreSQL; también llama a products-ms por NATS |
 | `products-ms/` | Microservicio NATS sin HTTP + Prisma/SQLite |
-| `payments-ms/` | API HTTP (`:3003`) + Stripe; no usa NATS ni base de datos |
+| `payments-ms/` | API HTTP (`:3003`) + Stripe + cliente NATS (`Transport.NATS`); sin base de datos |
 | `docker-compose.yaml` / `docker-compose.prod.yaml` | Stacks de desarrollo y producción |
 | `scripts/migrate.sh` | Migraciones Prisma y seed de productos |
 
 - Cada app es un repo git propio. Cuando corresponda commitear, primero se commitea y pushea el submodule y después la raíz; al revés se pierden o pisan las referencias.
-- El `README.md` raíz es el manual de operación detallado (Docker, Prisma, NATS y troubleshooting), pero documenta solo los tres servicios originales: no incluye payments-ms.
+- El `README.md` raíz es el manual de operación detallado (Docker, Prisma, NATS, `.env` y troubleshooting).
 - `orders-ms/AGENTS.md` contiene las particularidades de ese servicio.
 
 ## Comandos
@@ -31,7 +31,8 @@ Todo el desarrollo corre en Docker; el host no tiene `node_modules` instalados.
 
 ## Gotchas que rompen el stack
 
-- **`payments-ms/.env` tiene que existir en el host.** El Compose raíz lo carga con `env_file:` y falla por completo si el archivo no existe. Crearlo desde `payments-ms/.env.template` y completar Stripe. Está gitignored: no commitear las claves ni copiarlas al YAML.
+- **El `.env` de la raíz tiene que existir.** El Compose de payments-ms interpola `${PORT}` y las `${STRIPE_*}` desde `./.env`; si falta una, Compose avisa `variable is not set` y la app muere con `Config validation error`. Se crea con `cp .env.template .env` y se completan las claves de Stripe. Está gitignored: no commitear las claves ni copiarlas al YAML. `payments-ms/.env` es un symlink a `../.env` para el flujo en host (`pnpm start:dev`); tampoco se commitea ni viaja en la imagen.
+- **Container "Up" no significa app viva.** En `payments-ms` (y cualquier servicio en modo watch) el `nest start --watch` sobrevive si el proceso de la app muere: `docker compose ps` lo muestra "Up" pero la API no responde (`curl` da HTTP 000). Ante un comportamiento raro, mirar `docker compose logs` antes de asumir que está sano.
 - **Cada `package.json` necesita `"packageManager": "pnpm@11.23.0+sha512..."`.** Los Dockerfiles usan `corepack enable pnpm`; sin ese campo Corepack puede resolver otra versión y `pnpm install --frozen-lockfile` falla contra el lockfile de pnpm 11.
 - **`pnpm-workspace.yaml` se copia antes de instalar.** Ahí vive `allowBuilds` (pnpm 10+); sin ese archivo pnpm bloquea postinstalls como `@parcel/watcher`, `prisma` y `better-sqlite3`.
 - **`target:` en `build:` es obligatorio.** Sin él, Compose construye la última etapa del Dockerfile (`production`) y no hay hot-reload.
@@ -40,7 +41,7 @@ Todo el desarrollo corre en Docker; el host no tiene `node_modules` instalados.
 - **`procps` es necesario en la etapa `deps`.** Aporta `ps`, que usa tree-kill del Nest CLI; sin él queda el proceso viejo con el puerto tomado, aparece `EADDRINUSE` y el hot-reload no recarga.
 - **`openssl` solo corresponde a `base-prisma`** de orders-ms y products-ms. client-gateway y payments-ms no usan Prisma.
 - **El entrypoint compilado cambia según el servicio:** orders-ms y products-ms generan `dist/src/main.js` porque compilan también el `prisma7.config.ts` de la raíz; client-gateway y payments-ms generan `dist/main.js`. Por eso `pnpm start:prod` (`node dist/main`) está roto en orders-ms y products-ms.
-- Dentro de los containers se usan nombres de servicio (`nats`, `orders-db`), no `localhost`. Las variables de `environment:` tienen prioridad sobre los `.env` locales; dotenv no pisa variables ya definidas.
+- Dentro de los containers se usan nombres de servicio (`nats`, `orders-db`), no `localhost`. Las variables de `environment:` tienen prioridad sobre los `.env`; dotenv no pisa variables ya definidas. Por eso `payments-ms` recibe `NATS_SERVERS: "nats://nats:4222"` literal en el compose, mientras el `.env` conserva `localhost` para el flujo en host.
 - `docker-compose.prod.yaml` todavía no incluye payments-ms.
 
 ## Contratos entre servicios
@@ -49,7 +50,8 @@ Todo el desarrollo corre en Docker; el host no tiene `node_modules` instalados.
 - Existe el typo vigente `{ cmd: 'crete_product' }` tanto en el gateway como en products-ms. No corregirlo de un solo lado.
 - orders-ms llama a products-ms con `{ cmd: 'validate_ids_products' }` al validar productos de una orden; products-ms debe estar disponible para ese flujo.
 - El gateway usa `app.setGlobalPrefix('api')`: las rutas públicas son `/api/products` y `/api/orders`.
-- payments-ms valida con Joi `PORT`, `STRIPE_SECRET`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_SUCCESS_URL` y `STRIPE_CANCEL_URL`; sin alguna, tira `Config validation error` al bootear.
+- payments-ms valida con Joi `PORT`, `STRIPE_SECRET`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_SUCCESS_URL`, `STRIPE_CANCEL_URL` y `NATS_SERVERS`; sin alguna, tira `Config validation error` al bootear.
+- payments-ms abre el transporte NATS en el bootstrap (`connectMicroservice` + `startAllMicroservices`) aunque hoy no declara `@MessagePattern`: si NATS no responde, el proceso muere y se cae también su API HTTP.
 
 ## Tests y lint
 

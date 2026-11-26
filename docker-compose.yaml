@@ -220,8 +220,8 @@ services:
     # CMD desde el Dockerfile: pnpm run start:dev
 
   # ---------------------------------------------------------------------------
-  # Microservicio de pagos (HTTP + Stripe). No depende de NATS ni de ninguna DB:
-  # es una API HTTP que crea sesiones de checkout y recibe el webhook de Stripe.
+  # Microservicio de pagos: API HTTP (:3003) + Stripe, y ademas se conecta a
+  # NATS como microservicio (app.connectMicroservice en src/main.ts). No usa DB.
   # ---------------------------------------------------------------------------
   payments-ms:
     # Etapa `development` del Dockerfile multi-stage (con hot-reload).
@@ -236,20 +236,33 @@ services:
     # estar publicado en el host para que el navegador pueda volver del checkout.
     ports: ["3003:3003"]
 
-    # Las variables salen del .env del microservicio (PORT, STRIPE_SECRET,
-    # STRIPE_WEBHOOK_SECRET, STRIPE_SUCCESS_URL, STRIPE_CANCEL_URL). Todas son
-    # Joi-required en src/config/envs.ts: sin alguna, la app tira
-    # "Config validation error" al arrancar.
-    # Se usa env_file en vez de hardcodearlas aca para no commitear las claves
-    # de Stripe: el .env esta gitignored y excluido del build por .dockerignore.
-    env_file: ./payments-ms/.env
+    # Las variables salen del .env de la RAIZ (gitignored): Compose las interpola
+    # con ${...} al leer este archivo y se las pasa al container. Asi las claves
+    # de Stripe no se commitean ni se hornean en la imagen.
+    # Las 5 de Stripe son Joi-required en src/config/envs.ts: si falta alguna,
+    # Compose avisa "variable is not set" y la app tira "Config validation error".
+    environment:
+      PORT: "${PORT}"
+      STRIPE_SECRET: "${STRIPE_SECRET}"
+      STRIPE_WEBHOOK_SECRET: "${STRIPE_WEBHOOK_SECRET}"
+      STRIPE_SUCCESS_URL: "${STRIPE_SUCCESS_URL}"
+      STRIPE_CANCEL_URL: "${STRIPE_CANCEL_URL}"
+      # Literal, NO interpolado: dentro del container el broker se llama "nats"
+      # (nombre de servicio). El .env conserva "localhost" porque ese valor es
+      # para el flujo en host (pnpm start:dev).
+      NATS_SERVERS: "nats://nats:4222"
+
+    # La conexion a NATS se abre en el bootstrap: si el broker no esta listo,
+    # el proceso muere (y con el la API HTTP de Stripe).
+    depends_on:
+      nats:
+        condition: service_healthy
 
     # Hot-reload del codigo (mismo criterio que orders-ms y products-ms):
     # solo se monta ./src, node_modules NO se monta porque los symlinks de pnpm
     # quedarian rotos apuntando al node_modules del host.
     volumes: ["./payments-ms/src:/usr/src/app/src"]
 
-    # Sin depends_on: no consume NATS ni base de datos.
     # CMD desde el Dockerfile: pnpm run start:dev
 
 # ------------------------------------------------------------------------------

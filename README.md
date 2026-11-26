@@ -32,15 +32,16 @@ Si se hace al revés, se perderán las referencias de los sub-módulos en el rep
 
 # NestJS Microservicios — stack completo en Docker
 
-Levantamiento de los tres servicios del proyecto (`client-gateway`, `orders-ms`,
-`products-ms`) junto con su infraestructura (PostgreSQL y NATS) con un único
-comando de Docker Compose.
+Levantamiento de los cuatro servicios del proyecto (`client-gateway`, `orders-ms`,
+`products-ms` y `payments-ms`) junto con su infraestructura (PostgreSQL y NATS)
+con un único comando de Docker Compose.
 
 Cada sub-proyecto tiene su propio README con el flujo de desarrollo en el host:
 
 - [`client-gateway/README.md`](./client-gateway/README.md)
 - [`orders-ms/README.md`](./orders-ms/README.md)
 - [`products-ms/README.md`](./products-ms/README.md)
+- [`payments-ms/README.md`](./payments-ms/README.md)
 
 ## Arquitectura
 
@@ -63,7 +64,18 @@ Cada sub-proyecto tiene su propio README con el flujo de desarrollo en el host:
          │     orders-db      │          │   products-data    │
          │  postgres:16.2     │          │  (named volume)    │
          └────────────────────┘          └────────────────────┘
+
+   HTTP  :3003  ─────────▶ ┌────────────────────┐ ─── HTTPS ───▶ Stripe (externo)
+   /payments               │    payments-ms     │
+                           │  (HTTP + Stripe +  │ ─── NATS ────▶ nats://nats:4222
+                           │   cliente NATS)    │
+                           └────────────────────┘
 ```
+
+`payments-ms` es la única pieza que no depende de una base de datos: expone su API
+HTTP, habla con Stripe y además se conecta al broker NATS como microservicio
+(hoy sin `@MessagePattern`). Su conexión a NATS se abre en el arranque, así que si
+el broker no está disponible el proceso muere y se cae también la API HTTP.
 
 | Servicio         | Imagen / build             | Puertos publicados                      | Volumen de datos                                     |
 |------------------|----------------------------|-----------------------------------------|------------------------------------------------------|
@@ -72,6 +84,7 @@ Cada sub-proyecto tiene su propio README con el flujo de desarrollo en el host:
 | `orders-ms`      | build `./orders-ms`        | — (no expone HTTP)                      | —                                                    |
 | `products-ms`    | build `./products-ms`      | — (no expone HTTP)                      | `products-data` (`/data`)                            |
 | `client-gateway` | build `./client-gateway`   | `3000`                                  | —                                                    |
+| `payments-ms`    | build `./payments-ms`      | `3003`                                  | —                                                    |
 
 El `docker-compose.yaml` de la raíz está comentado línea por línea: cada
 servicio explica qué hace y por qué está configurado como está.
@@ -84,7 +97,11 @@ servicio explica qué hace y por qué está configurado como está.
 ## Dev
 1. Clonar el repositorio
 2. Ejecutar el comando `git submodule update --init --recursive` para reconstruir los submodulos.
-3. Ejecutar en bash
+3. Crear el `.env` de la raíz, que es donde viven las variables de `payments-ms` (incluidas las claves de Stripe), y completar los valores:
+```
+cp .env.template .env
+```
+4. Ejecutar en bash
 ```
 docker compose up -d --build
 ```
@@ -103,6 +120,7 @@ Después:
 ```bash
 curl http://localhost:3000/api/products
 curl http://localhost:3000/api/orders
+curl http://localhost:3003/payments/cancel
 ```
 
 > **La primera vez hay que aplicar las migraciones** (la base arranca vacía):
@@ -184,11 +202,14 @@ las dos imágenes:
 | Etapa | Qué tiene | Para qué |
 |-------|-----------|----------|
 | `base` | node + corepack (pnpm) | base común |
-| `base-prisma` | base + `openssl` | solo los microservicios: Prisma necesita libssl |
+| `base-prisma` | base + `openssl` | solo orders-ms y products-ms: Prisma necesita libssl |
 | `deps` | `pnpm install` completo (con devDependencies) | se reusa en `builder` y `development` |
 | `builder` | fuente + `prisma generate` + `pnpm build` | compila el `dist/` |
 | `development` | deps + fuente + cliente Prisma | hot-reload (`nest start --watch`) |
 | `production` | `pnpm install --prod` + `dist` | runtime sin tsc, sin watch y sin devDependencies |
+
+`payments-ms` no tiene la etapa `base-prisma` (ni `prisma generate`): no usa
+Prisma, solo Stripe. `client-gateway` tampoco.
 
 Se construye por target:
 
@@ -210,13 +231,15 @@ docker compose -f docker-compose.prod.yaml build  # target: production
 | `client-gateway` (dev) | 869 MB | **666 MB** |
 | `orders-ms` (dev) | 1.52 GB | **1.12 GB** |
 | `products-ms` (dev) | 1.57 GB | **1.17 GB** |
+| `payments-ms` (dev) | — | **699 MB** |
 | `client-gateway` (prod) | — | **449 MB** |
 | `orders-ms` (prod) | — | **944 MB** |
 | `products-ms` (prod) | — | **938 MB** |
+| `payments-ms` (prod) | — | **475 MB** |
 
-| Stack | RAM de los 3 servicios |
+| Stack | RAM de los servicios |
 |---|---|
-| desarrollo (con `tsc` en watch) | ~1.6 GB |
+| desarrollo (con `tsc` en watch) | ~1.6 GB (4 servicios) |
 | producción (sin watch) | **~250 MB** |
 
 De dónde sale el ahorro: el **metadata cache del registry** que pnpm guarda
@@ -239,6 +262,8 @@ Qué cambia respecto al stack de desarrollo:
   bases ya migradas se reutilizan tal cual.
 - Los dos stacks usan los mismos `container_name` y puertos → **no pueden
   correr al mismo tiempo**: pará el de desarrollo antes de levantar este.
+- `docker-compose.prod.yaml` todavía **no incluye `payments-ms`**: el stack de
+  producción levanta solo gateway, orders y products.
 
 ## Comandos útiles
 
@@ -252,6 +277,7 @@ Qué cambia respecto al stack de desarrollo:
 | Ver logs de NATS                | `docker compose logs -f nats`                                      |
 | Estado de NATS (JSON)           | `curl http://localhost:8222/healthz`                               |
 | Conectar al Postgres            | `docker compose exec orders-db psql -U postgres -d ordersdb`       |
+| Probar la API de pagos          | `curl http://localhost:3003/payments/cancel`                       |
 | Resetear solo la base de orders | `docker compose down -v orders-db && docker compose up -d orders-db` |
 | **Aplicar migraciones + seed**  | `./scripts/migrate.sh`                                             |
 | Build secuencial (menos RAM)    | `COMPOSE_PARALLEL_LIMIT=1 docker compose build`                    |
@@ -264,7 +290,14 @@ Las variables se inyectan desde el `docker-compose.yaml` (`environment:`) y
 **tienen prioridad sobre los `.env`** (dotenv no pisa variables ya definidas
 en el entorno).
 
-| Servicio         | Variable       | Valor en Docker                                                            | `.env` local (no se usa)          |
+`payments-ms` es el único servicio que no hardcodea sus variables en el compose:
+las interpola con `${...}` desde el **`.env` de la raíz** (`PORT` y las
+`STRIPE_*`). Por eso ese archivo tiene que existir antes de levantar el stack
+(`cp .env.template .env`). Está gitignored, igual que `payments-ms/.env`, que es
+un symlink a `../.env` para el flujo en host. `NATS_SERVERS` sí va literal en el
+compose (`nats://nats:4222`) porque el `.env` conserva `localhost`.
+
+| Servicio         | Variable       | Valor en Docker                                                            | `.env` en host (solo dev en host)  |
 |------------------|----------------|----------------------------------------------------------------------------|------------------------------------|
 | `client-gateway` | `PORT`         | `3000`                                                                     | `3000`                             |
 | `client-gateway` | `NATS_SERVERS` | `nats://nats:4222`                                                         | `nats://localhost:4222`            |
@@ -274,8 +307,11 @@ en el entorno).
 | `products-ms`    | `PORT`         | `3001`                                                                     | `3001`                             |
 | `products-ms`    | `NATS_SERVERS` | `nats://nats:4222`                                                         | `nats://localhost:4222,nats://localhost:4223` |
 | `products-ms`    | `DATABASE_URL` | `file:/data/dev.db`                                                        | `file:./dev.db`                    |
+| `payments-ms`    | `PORT`         | `${PORT}` desde el `.env` raíz                                            | `3003`                             |
+| `payments-ms`    | `NATS_SERVERS` | `nats://nats:4222` (literal en el compose)                                | `nats://localhost:4222,nats://localhost:4223` |
+| `payments-ms`    | `STRIPE_*`     | `${STRIPE_*}` desde el `.env` raíz (4 variables, todas Joi-required)      | las mismas del `.env` raíz         |
 
-Los `.env` locales quedan intactos para el flujo de desarrollo en el host.
+Los `.env` de cada sub-proyecto quedan intactos para el flujo de desarrollo en el host.
 
 ## Hot reload
 
@@ -286,7 +322,7 @@ volumes:
   - ./orders-ms/src:/usr/src/app/src
 ```
 
-Los tres servicios corren con `nest start --watch`, así que los cambios en
+Los cuatro servicios corren con `nest start --watch`, así que los cambios en
 `src/` se recompilan y recargan solos.
 
 Dos advertencias:
@@ -301,7 +337,7 @@ Dos advertencias:
 ## pnpm dentro de Docker
 
 La imagen oficial `node:24-bookworm-slim` **no incluye pnpm** (sí npm). En vez
-de instalarlo con `npm i -g pnpm` (que suma ~59 MB), los tres `Dockerfile` usan
+de instalarlo con `npm i -g pnpm` (que suma ~59 MB), los cuatro `Dockerfile` usan
 **corepack**, que ya viene incluido en la distribución de Node 24:
 
 ```dockerfile
@@ -420,10 +456,13 @@ command: ["-js", "-sd", "/data", "-m", "8222"]
 - `-js` habilita JetStream, `-sd /data` define el store (en el volumen).
 - `-m 8222` habilita el endpoint de monitoring: `http://localhost:8222/healthz`
   se usa como healthcheck del container.
-- Los `.env` locales de `orders-ms` y `products-ms` listan dos servers
+- Los `.env` de `orders-ms` y `products-ms` listan dos servers
   (`4222` y `4223`); con un solo server se inyecta `nats://nats:4222`.
   `orders-ms` hace `split(',')` y el gateway lo consume como string: ambos
   funcionan con un único valor.
+- `payments-ms` también se conecta al broker (como cliente, `Transport.NATS`) y
+  recibe `nats://nats:4222` literal desde el compose. Si el broker no está
+  disponible al arrancar, el proceso muere y se cae también su API HTTP.
 
 ## Troubleshooting
 
@@ -450,6 +489,19 @@ volumes no debería ocurrir; si pasa, `docker compose down -v` y volvé a levant
 **Cambié `prisma/schema.prisma` y no se refleja**
 Reconstruí el servicio: `docker compose up -d --build orders-ms`
 (el `prisma generate` corre en el build).
+
+**`NatsError: CONNECTION_REFUSED 127.0.0.1:4222` en `payments-ms`**
+El container está intentando conectar a `localhost` en vez del servicio `nats`.
+El compose inyecta `NATS_SERVERS: "nats://nats:4222"` literal; si lo cambiaste
+por `${NATS_SERVERS}`, el `.env` (que dice `localhost` para el flujo en host)
+vuelve a romperlo. La conexión se abre en el bootstrap: si falla, el proceso
+muere y la API HTTP deja de responder.
+
+**`docker compose ps` muestra `payments-ms` "Up" pero la API no responde**
+El `nest start --watch` sobrevive aunque el proceso de la app muera (por ejemplo
+por un `Config validation error` o porque NATS no estaba disponible). `ps` sigue
+diciendo "Up" pero `curl` da HTTP 000. Mirá `docker compose logs payments-ms`
+antes de asumir que está sano.
 
 **El puerto 3000/5432/4222 está ocupado**
 `docker compose ps` y `ss -ltnp | grep -E '3000|5432|4222'`. El
@@ -479,7 +531,7 @@ Comparten `container_name` y puertos. Pará uno antes de levantar el otro:
 `docker compose down` y después `docker compose -f docker-compose.prod.yaml up -d`.
 
 **Un container muere con exit 137 (SIGKILL) durante los builds**
-Es el OOM killer: sin swap, 3 `pnpm install` en paralelo + los 3 `tsc` en watch
+Es el OOM killer: sin swap, 4 `pnpm install` en paralelo + los 4 `tsc` en watch
 consumen demasiado. Construí de a uno con `COMPOSE_PARALLEL_LIMIT=1 docker compose build`,
 o usá el stack de producción (sin watch: ~250 MB de RAM en vez de ~1.6 GB).
 
